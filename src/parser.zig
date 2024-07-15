@@ -9,11 +9,16 @@ const TokenType = enum {
     INTEGER,
     FLOAT,
     IDENT,
+    FN,
+    RETURN,
     OPERATION,
     LPAREN,
     RPAREN,
+    LCURLY,
+    RCURLY,
     EQUAL,
     COLON,
+    COMMA,
     SEMI,
     BIT_LSH,
     BIT_RSH,
@@ -88,11 +93,14 @@ const Lexer = struct {
             '+', '-', '*', '/' => self.advanceWithToken(TokenType.OPERATION, toSlice(self.char, std.heap.page_allocator)),
             '(' => self.advanceWithToken(.LPAREN, toSlice(self.char, std.heap.page_allocator)),
             ')' => self.advanceWithToken(.RPAREN, toSlice(self.char, std.heap.page_allocator)),
+            '{' => self.advanceWithToken(.LCURLY, toSlice(self.char, std.heap.page_allocator)),
+            '}' => self.advanceWithToken(.RCURLY, toSlice(self.char, std.heap.page_allocator)),
             '&' => self.advanceWithToken(.BIT_AND, toSlice(self.char, std.heap.page_allocator)),
             '^' => self.advanceWithToken(.BIT_XOR, toSlice(self.char, std.heap.page_allocator)),
             '|' => self.advanceWithToken(.BIT_OR, toSlice(self.char, std.heap.page_allocator)),
             ';' => self.advanceWithToken(.SEMI, toSlice(self.char, std.heap.page_allocator)),
             ':' => self.advanceWithToken(.COLON, toSlice(self.char, std.heap.page_allocator)),
+            ',' => self.advanceWithToken(.COMMA, toSlice(self.char, std.heap.page_allocator)),
             '=' => self.advanceWithToken(.EQUAL, toSlice(self.char, std.heap.page_allocator)),
             0 => self.advanceWithToken(.EOF, ""),
             else => self.advanceWithToken(TokenType.NO_OP, toSlice(self.char, std.heap.page_allocator)),
@@ -113,7 +121,28 @@ const Lexer = struct {
             return Token.EOF();
         };
 
+        if (isKeyword(value)) {
+            return self.getBuiltin(value);
+        }
+
         return Token{ .type = .IDENT, .value = value, .loc = .{ .row = self.row, .col = self.col } };
+    }
+
+    fn getBuiltin(self: *Lexer, value: []u8) Token {
+        var tokenType: TokenType = undefined;
+        if (std.mem.eql(u8, value, "fn")) {
+            tokenType = .FN;
+        } else if (std.mem.eql(u8, value, "return")) {
+            tokenType = .RETURN;
+        } else {
+            tokenType = .EOF;
+        }
+
+        return Token{ .type = tokenType, .value = value, .loc = .{ .row = self.row, .col = self.col } };
+    }
+
+    fn isKeyword(value: []u8) bool {
+        return std.mem.eql(u8, value, "fn") or std.mem.eql(u8, value, "return");
     }
 
     fn readNumeric(self: *Lexer) Token {
@@ -183,6 +212,8 @@ const AstNodeTag = enum {
     ident,
     varDecl,
     varAssign,
+    funcDecl,
+    ret,
     program,
 };
 
@@ -207,6 +238,19 @@ pub const Ast = struct {
             value: Token,
             loc: Location,
         };
+        pub const FuncArg = struct { ident: Ast.Node.Ident, type: Ast.Node.Ident };
+        pub const Return = struct {
+            token: Token,
+            value: Ast.Node,
+            loc: Location,
+        };
+        pub const FuncDecl = struct {
+            ident: Ast.Node.Ident,
+            retType: Ast.Node.Ident,
+            args: std.ArrayList(Ast.Node.FuncArg),
+            block: std.ArrayList(Ast.Node),
+            loc: Location,
+        };
         pub const VarDecl = struct {
             ident: Ast.Node.Ident,
             value: Ast.Node,
@@ -225,6 +269,8 @@ pub const Ast = struct {
         ident: *Ast.Node.Ident,
         varDecl: *Ast.Node.VarDecl,
         varAssign: *Ast.Node.VarAssign,
+        funcDecl: *Ast.Node.FuncDecl,
+        ret: *Ast.Node.Return,
         program: *Ast.Node.Program,
 
         pub fn getTag(self: *const Ast.Node) AstNodeTag {
@@ -259,6 +305,30 @@ pub const Ast = struct {
                 std.debug.panic("Could not create new Number ast node\n", .{});
             };
             mem.value = value;
+            mem.loc = loc;
+
+            return mem;
+        }
+
+        pub fn allocReturn(token: Token, value: Ast.Node, loc: Location, alloc: std.mem.Allocator) *Ast.Node.Return {
+            var mem = alloc.create(Ast.Node.Return) catch {
+                std.debug.panic("Could not create new Number ast node\n", .{});
+            };
+            mem.token = token;
+            mem.value = value;
+            mem.loc = loc;
+
+            return mem;
+        }
+
+        pub fn allocFuncDecl(ident: *Ident, args: *std.ArrayList(Ast.Node.FuncArg), block: *std.ArrayList(Ast.Node), retType: *Ident, loc: Location, alloc: std.mem.Allocator) *Ast.Node.FuncDecl {
+            var mem = alloc.create(Ast.Node.FuncDecl) catch {
+                std.debug.panic("Could not create new FuncDecl ast node\n", .{});
+            };
+            mem.ident = ident.*;
+            mem.args = args.*;
+            mem.block = block.*;
+            mem.retType = retType.*;
             mem.loc = loc;
 
             return mem;
@@ -309,46 +379,128 @@ pub const Parser = struct {
     }
 
     pub fn parseInput(self: *Parser) Ast {
-        const list = std.ArrayList(Ast.Node).init(self.allocator);
-        var program = Ast.Node.Program{
-            .expressions = list,
+        const program = Ast.Node.Program{
+            .expressions = self.parseBlock(.EOF),
         };
-        while (self.current().type != .EOF) {
+        return Ast{ .head = program };
+    }
+
+    fn parseBlock(self: *Parser, endToken: TokenType) std.ArrayList(Ast.Node) {
+        var list = std.ArrayList(Ast.Node).init(self.allocator);
+
+        while (self.current().type != endToken) {
             const expr = switch (self.current().type) {
                 .IDENT => switch (self.peek().type) {
-                    .COLON => self.parseVarDecl(),
-                    .EQUAL => self.parseVarAssign(),
+                    .COLON => self.parseDecl(),
+                    .EQUAL => block: {
+                        const res = self.parseVarAssign();
+                        self.consume(&[_]TokenType{.SEMI});
+                        break :block res;
+                    },
                     else => {
                         std.debug.print("{d}:{d}: ERROR: Invalid token after identifer. Found: {any}\n", .{ self.peek().loc.row, self.peek().loc.col, self.peek().type });
                         std.process.exit(1);
                     },
                 },
-                TokenType.LPAREN, TokenType.FLOAT, TokenType.INTEGER => self.parseExpr(),
+                .RETURN => block: {
+                    const res = self.parseReturn();
+                    self.consume(&[_]TokenType{.SEMI});
+                    break :block res;
+                },
+                TokenType.LPAREN, TokenType.FLOAT, TokenType.INTEGER => block: {
+                    const res = self.parseExpr();
+                    self.consume(&[_]TokenType{.SEMI});
+                    break :block res;
+                },
                 else => {
                     std.debug.print("{d}:{d}: ERROR: Invalid token. Found: {any}\n", .{ self.current().loc.row, self.current().loc.col, self.current().type });
                     std.process.exit(1);
                 },
             };
 
-            self.consume(&[_]TokenType{.SEMI});
-
-            program.expressions.append(expr) catch {
+            list.append(expr) catch {
                 std.debug.print("Could not append new Ast node to program list. Exiting...\n", .{});
                 std.process.exit(1);
             };
             //std.debug.print("Expression #{d}: {any}\n", .{ program.expressions.items.len, expr });
             //std.debug.print("Next token: {any}\n", .{self.peek()});
         }
-        return Ast{ .head = program };
+
+        return list;
     }
 
-    fn parseVarDecl(self: *Parser) Ast.Node {
-        // std.debug.print("parse var decl\n", .{});
+    fn parseReturn(self: *Parser) Ast.Node {
+        std.debug.assert(self.current().type == .RETURN);
+        const retToken = self.current();
+        self.consume(&[_]TokenType{.RETURN});
+
+        const retVal = self.parseExpr();
+
+        return Ast.Node{ .ret = Ast.Node.allocReturn(retToken, retVal, retToken.loc, self.allocator) };
+    }
+
+    fn parseDecl(self: *Parser) Ast.Node {
         std.debug.assert(self.current().type == .IDENT);
         const varNode = self.parseExpr();
 
         self.consume(&[_]TokenType{.COLON});
         self.consume(&[_]TokenType{.EQUAL});
+
+        if (self.current().type == .FN) {
+            return self.parseFuncDecl(varNode);
+        } else {
+            const res = self.parseVarDecl(varNode);
+            self.consume(&[_]TokenType{.SEMI});
+            return res;
+        }
+    }
+
+    fn parseFuncDecl(self: *Parser, varNode: Ast.Node) Ast.Node {
+        std.debug.assert(varNode.getTag() == .ident);
+        std.debug.assert(self.current().type == .FN);
+
+        self.consume(&[_]TokenType{.FN});
+
+        var args = self.parseFuncArgs();
+
+        const retType = self.parseExpr();
+
+        self.consume(&[_]TokenType{.LCURLY});
+        var block = self.parseBlock(.RCURLY);
+        self.consume(&[_]TokenType{.RCURLY});
+
+        return Ast.Node{ .funcDecl = Ast.Node.allocFuncDecl(varNode.ident, &args, &block, retType.ident, varNode.ident.loc, self.allocator) };
+    }
+
+    fn parseFuncArgs(self: *Parser) std.ArrayList(Ast.Node.FuncArg) {
+        self.consume(&[_]TokenType{.LPAREN});
+        var args = std.ArrayList(Ast.Node.FuncArg).init(self.allocator);
+
+        while (self.current().type != .RPAREN) {
+            args.append(self.parseFuncArg()) catch unreachable;
+            if (self.current().type == .COMMA) {
+                self.consume(&[_]TokenType{.COMMA});
+            }
+        }
+
+        self.consume(&[_]TokenType{.RPAREN});
+
+        return args;
+    }
+
+    fn parseFuncArg(self: *Parser) Ast.Node.FuncArg {
+        _ = self.expect(&[_]TokenType{.IDENT});
+        const ident = self.parseExpr();
+
+        _ = self.expect(&[_]TokenType{.IDENT});
+        const t = self.parseExpr();
+
+        return Ast.Node.FuncArg{ .ident = ident.ident.*, .type = t.ident.* };
+    }
+
+    fn parseVarDecl(self: *Parser, varNode: Ast.Node) Ast.Node {
+        // std.debug.print("parse var decl\n", .{});
+        std.debug.assert(varNode.getTag() == .ident);
 
         const value = self.parseExpr();
 

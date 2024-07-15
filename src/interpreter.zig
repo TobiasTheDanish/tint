@@ -432,6 +432,7 @@ pub const Interpreter = struct {
             .ident => |val| self.interpretIdent(val),
             .varDecl => |val| self.interpretVarDecl(val),
             .varAssign => |val| self.interpretVarAssign(val),
+            .funcDecl, .ret => unreachable,
             .program => unreachable,
         }
     }
