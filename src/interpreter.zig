@@ -1,6 +1,9 @@
 const std = @import("std");
 const parsing = @import("./parser.zig");
+const symTable = @import("symbolTable.zig");
 
+const Symbol = symTable.Symbol;
+const SymbolTable = symTable.SymbolTable;
 const Ast = parsing.Ast;
 const Parser = parsing.Parser;
 const Token = parsing.Token;
@@ -46,8 +49,8 @@ fn Stack(comptime T: type) type {
 }
 
 pub const Interpreter = struct {
-    const ResultTag = enum { int, float, err };
-    const Result = union(ResultTag) {
+    pub const ResultTag = enum { int, float, err };
+    pub const Result = union(ResultTag) {
         int: i64,
         float: f64,
         err: struct {
@@ -380,20 +383,15 @@ pub const Interpreter = struct {
         }
     };
 
-    pub const Symbol = struct {
-        name: []const u8,
-        val: ?Result,
-    };
-
     stack: Stack(Symbol),
-    symbolTable: std.StringHashMap(Result),
+    symbolTable: SymbolTable,
     allocator: std.mem.Allocator,
 
-    pub fn init(alloc: std.mem.Allocator) !Interpreter {
+    pub fn init(alloc: std.mem.Allocator, table: *SymbolTable) !Interpreter {
         return .{
             .allocator = alloc,
             .stack = try Stack(Symbol).init(4, alloc),
-            .symbolTable = std.StringHashMap(Result).init(alloc),
+            .symbolTable = table.*,
         };
     }
 
@@ -416,13 +414,8 @@ pub const Interpreter = struct {
                 }
             }
         }
-        var symbolKeys = self.symbolTable.keyIterator();
 
-        std.debug.print("Symbol table:\n", .{});
-        while (symbolKeys.next()) |key| {
-            const val = self.symbolTable.get(key.*).?;
-            std.debug.print("    name: {s}, val: {s}\n", .{ key.*, val.toStr(self.allocator) });
-        }
+        self.symbolTable.print();
     }
 
     fn interpretAstNode(self: *Interpreter, node: Ast.Node) void {
@@ -432,22 +425,30 @@ pub const Interpreter = struct {
             .ident => |val| self.interpretIdent(val),
             .varDecl => |val| self.interpretVarDecl(val),
             .varAssign => |val| self.interpretVarAssign(val),
-            .funcDecl, .ret => unreachable,
+            .funcDecl => |val| self.interpretFuncDecl(val),
+            .ret => unreachable,
             .program => unreachable,
         }
     }
 
     fn interpretIdent(self: *Interpreter, node: *Ast.Node.Ident) void {
-        const resMaybe = self.symbolTable.get(node.value.value);
+        const resMaybe = self.symbolTable.getSymbol(node.value.value);
         if (resMaybe == null) {
-            std.debug.print("{d}:{d}: Ident {s} is undefined\n", .{ node.loc.row, node.loc.col, node.value.value });
+            std.debug.panic("{d}:{d}: Symbol table creation failed on identifier '{s}'\n", .{ node.loc.row, node.loc.col, node.value.value });
         } else {
             const res = resMaybe.?;
-            std.debug.print("{d}:{d}: {s} value: {s}\n", .{ node.loc.row, node.loc.col, node.value.value, res.toStr(self.allocator) });
+            const val = res.val;
+
+            if (val != null) {
+                std.debug.print("{d}:{d}: {s} value: {s}\n", .{ node.loc.row, node.loc.col, node.value.value, val.?.toStr(self.allocator) });
+            } else {
+                std.debug.print("{d}:{d}: {s} is being declared\n", .{ node.loc.row, node.loc.col, node.value.value });
+            }
+
+            self.stack.push(res) catch |err| {
+                std.debug.print("INTERNAL ERROR: Could not push indent to stack: {?}\n", .{err});
+            };
         }
-        self.stack.push(Symbol{ .name = node.value.value, .val = resMaybe }) catch |err| {
-            std.debug.print("INTERNAL ERROR: Could not push indent to stack: {?}\n", .{err});
-        };
     }
 
     fn interpretVarAssign(self: *Interpreter, node: *Ast.Node.VarAssign) void {
@@ -474,11 +475,14 @@ pub const Interpreter = struct {
             return;
         }
 
-        const val = valSym.?.val.?;
+        const val = valSym.?;
 
-        self.symbolTable.put(ident.name, val) catch |err| {
-            std.debug.print("INTERNAL ERROR: Could not update symbol '{s}' in symboltable: {?}\n", .{ ident.name, err });
-        };
+        if (!std.mem.eql(u8, ident.type, val.type)) {
+            std.debug.print("{d}:{d}: ERROR: Cannot assign value of type '{s}' to symbol of type '{s}'.\n", .{ node.loc.row, node.loc.col, val.type, ident.type });
+            return;
+        }
+
+        self.symbolTable.addSymbol(.{ .name = ident.name, .type = ident.type, .val = val.val });
     }
 
     fn interpretVarDecl(self: *Interpreter, node: *Ast.Node.VarDecl) void {
@@ -498,17 +502,21 @@ pub const Interpreter = struct {
 
         self.interpretAstNode(node.value);
 
-        const valSym = self.stack.pop();
-        if (valSym == null or valSym.?.val == null) {
+        const valMaybe = self.stack.pop();
+        if (valMaybe == null or valMaybe.?.val == null) {
             std.debug.print("{d}:{d}: ERROR: Cannot assign void value to symbol '{s}'.\n", .{ node.loc.row, node.loc.col, ident.name });
             return;
         }
 
-        const val = valSym.?.val.?;
+        const val = valMaybe.?;
 
-        self.symbolTable.put(ident.name, val) catch |err| {
+        self.symbolTable.setSymbolVal(ident.name, val.val) catch |err| {
             std.debug.print("INTERNAL ERROR: Could not update symbol '{s}' in symboltable: {?}\n", .{ ident.name, err });
         };
+    }
+
+    fn interpretFuncDecl(_: *Interpreter, _: *Ast.Node.FuncDecl) void {
+        std.debug.panic("TODO: interpretFuncDecl not implemented yet\n", .{});
     }
 
     fn interpretBinOp(self: *Interpreter, node: *Ast.Node.BinOp) void {
@@ -570,12 +578,14 @@ pub const Interpreter = struct {
             .float => |val| blk: {
                 break :blk Symbol{
                     .name = "float",
+                    .type = "float",
                     .val = Result{ .float = val },
                 };
             },
             .int => |val| blk: {
                 break :blk Symbol{
                     .name = "int",
+                    .type = "int",
                     .val = Result{ .int = val },
                 };
             },
@@ -583,6 +593,7 @@ pub const Interpreter = struct {
                 val.*.loc = op.loc;
                 break :blk Symbol{
                     .name = "err",
+                    .type = "err",
                     .val = Result{ .err = val.* },
                 };
             },
@@ -595,7 +606,7 @@ pub const Interpreter = struct {
     fn interpretNumber(self: *Interpreter, node: *Ast.Node.Number) void {
         if (node.type == .float) {
             const val = std.fmt.parseFloat(f64, node.value.value) catch {
-                self.stack.push(Symbol{ .name = "error", .val = Result{ .err = .{
+                self.stack.push(Symbol{ .name = "error", .type = "error", .val = Result{ .err = .{
                     .message = "Invalid float.",
                     .loc = node.loc,
                 } } }) catch |err| {
@@ -603,14 +614,14 @@ pub const Interpreter = struct {
                 };
                 return;
             };
-            self.stack.push(Symbol{ .name = "float", .val = Result{
+            self.stack.push(Symbol{ .name = "float", .type = "float", .val = Result{
                 .float = val,
             } }) catch |err| {
                 std.debug.print("INTERNAL ERROR: Could not push result of bin op to stack: {?}\n", .{err});
             };
         } else {
             const val = std.fmt.parseInt(i64, node.value.value, 10) catch {
-                self.stack.push(Symbol{ .name = "error", .val = Result{ .err = .{
+                self.stack.push(Symbol{ .name = "error", .type = "error", .val = Result{ .err = .{
                     .message = "Invalid int.",
                     .loc = node.loc,
                 } } }) catch |err| {
@@ -618,7 +629,7 @@ pub const Interpreter = struct {
                 };
                 return;
             };
-            self.stack.push(Symbol{ .name = "int", .val = Result{
+            self.stack.push(Symbol{ .name = "int", .type = "int", .val = Result{
                 .int = val,
             } }) catch |err| {
                 std.debug.print("INTERNAL ERROR: Could not push result of bin op to stack: {?}\n", .{err});

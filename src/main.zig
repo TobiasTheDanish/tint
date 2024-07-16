@@ -1,10 +1,12 @@
 const std = @import("std");
 const parsing = @import("./parser.zig");
 const interpreter = @import("./interpreter.zig");
+const symbolTableVisitor = @import("symbolTableVisitor.zig");
 const pretty = @import("pretty");
 
 const Parser = parsing.Parser;
 const Interpreter = interpreter.Interpreter;
+const SymbolTableVisitor = symbolTableVisitor.SymbolTableVisitor;
 
 pub fn main() !void {
     const allocator = std.heap.page_allocator;
@@ -13,7 +15,11 @@ pub fn main() !void {
     _ = args.skip();
 
     const filepath = args.next() orelse "";
-    var i = try Interpreter.init(allocator);
+
+    var symTableVisitor = SymbolTableVisitor.init(allocator);
+    defer symTableVisitor.deinit();
+
+    var i: Interpreter = undefined;
     defer i.deinit();
 
     if (std.mem.eql(u8, filepath, "")) {
@@ -23,8 +29,11 @@ pub fn main() !void {
             try std.fmt.format(std.io.getStdOut(), "> ", .{});
             _ = try std.io.getStdIn().read(&buffer);
             var parser = try Parser.new(&buffer, 2, allocator);
-            const ast = parser.parseInput();
+            var ast = parser.parseInput();
 
+            var symTable = symTableVisitor.buildSymbolTable(&ast);
+
+            i = try Interpreter.init(allocator, &symTable);
             i.interpretAst(ast);
         }
     } else {
@@ -47,10 +56,13 @@ pub fn main() !void {
         const bufferSlice = try buffer.toOwnedSlice();
         var parser = try Parser.new(bufferSlice, 2, allocator);
 
-        const ast = parser.parseInput();
+        var ast = parser.parseInput();
 
         // try pretty.print(std.heap.page_allocator, ast, .{});
 
+        var symTable = symTableVisitor.buildSymbolTable(&ast);
+
+        i = try Interpreter.init(allocator, &symTable);
         i.interpretAst(ast);
     }
 }
